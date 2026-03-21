@@ -38,9 +38,24 @@ function drawShape(
   ctx.fill();
   ctx.globalAlpha = 1;
   ctx.strokeStyle = isDragging ? '#ffffff' : shape.color;
-  ctx.lineWidth = (isDragging ? 3 : 2) / zoom;   // counteract ctx.scale so width is always ~2px on screen
+  ctx.lineWidth = (isDragging ? 3 : 2) / zoom;
   roundedRect(ctx, x, y, shape.width, shape.height, 8);
   ctx.stroke();
+}
+
+// ─── Color picking helpers ────────────────────────────────────────────────────
+
+/** Encode a picking ID (1-based integer) into an rgb() string. */
+function encodePickingColor(id: number): string {
+  const r = (id >> 16) & 0xff;
+  const g = (id >>  8) & 0xff;
+  const b =  id        & 0xff;
+  return `rgb(${r},${g},${b})`;
+}
+
+/** Decode the RGBA pixel bytes read from getImageData back into a picking ID. */
+function decodePickingColor(r: number, g: number, b: number): number {
+  return (r << 16) | (g << 8) | b;
 }
 
 // ─── Component ───────────────────────────────────────────────────────────────
@@ -54,6 +69,37 @@ export default function CanvasNative() {
   const canvasOffsetRef = useRef({ x: -window.innerWidth, y: -window.innerHeight });
   const zoomRef = useRef(1);
 
+  // ─── Offscreen picking canvas ─────────────────────────────────────────────
+  // A hidden canvas rendered with solid unique colors per shape.
+  // getImageData at the click position decodes directly to a shape ID — O(1).
+
+  const offscreenRef = useRef<HTMLCanvasElement | null>(null);
+  // pickingId (integer) → shapeId (string)
+  const pickingMapRef = useRef<Map<number, string>>(new Map());
+  // shapeId (string) → pickingId (integer)
+  const shapeToPickingRef = useRef<Map<string, number>>(new Map());
+  const nextPickingIdRef = useRef(1);
+
+  // Assign a stable pickingId to every new shape; clean up removed ones.
+  useEffect(() => {
+    const currentIds = new Set(shapes.map((s) => s.id));
+
+    for (const [pickId, shapeId] of pickingMapRef.current) {
+      if (!currentIds.has(shapeId)) {
+        pickingMapRef.current.delete(pickId);
+        shapeToPickingRef.current.delete(shapeId);
+      }
+    }
+
+    for (const shape of shapes) {
+      if (!shapeToPickingRef.current.has(shape.id)) {
+        const pickId = nextPickingIdRef.current++;
+        pickingMapRef.current.set(pickId, shape.id);
+        shapeToPickingRef.current.set(shape.id, pickId);
+      }
+    }
+  }, [shapes]);
+
   // ─── Per-interaction refs ─────────────────────────────────────────────────
 
   const dragRef = useRef<{
@@ -62,7 +108,7 @@ export default function CanvasNative() {
     startCursorY: number;
     startShapeX: number;
     startShapeY: number;
-    lastDx: number;  // world-space delta
+    lastDx: number;
     lastDy: number;
   } | null>(null);
 
@@ -70,7 +116,7 @@ export default function CanvasNative() {
 
   const drawRef = useRef<{
     id: string;
-    startX: number;   // world-space
+    startX: number;
     startY: number;
     color: string;
     pendingX: number;
@@ -83,17 +129,44 @@ export default function CanvasNative() {
 
   // ─── Coordinate helpers ───────────────────────────────────────────────────
 
-  /** Convert screen (client) coordinates to world coordinates. */
   const toWorld = useCallback((screenX: number, screenY: number) => {
     const { x: ox, y: oy } = canvasOffsetRef.current;
     const zoom = zoomRef.current;
-    return {
-      x: (screenX - ox) / zoom,
-      y: (screenY - oy) / zoom,
-    };
+    return { x: (screenX - ox) / zoom, y: (screenY - oy) / zoom };
   }, []);
 
-  // ─── Render ───────────────────────────────────────────────────────────────
+  // ─── Picking render ───────────────────────────────────────────────────────
+
+  /** Redraws the offscreen picking canvas. Called at the end of every render(). */
+  const renderPicking = useCallback(() => {
+    const offscreen = offscreenRef.current;
+    if (!offscreen) return;
+    // willReadFrequently hint is set at context creation (in the resize effect).
+    const ctx = offscreen.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return;
+
+    const { shapes: currentShapes } = useCanvasStore.getState();
+    const { x: ox, y: oy } = canvasOffsetRef.current;
+    const zoom = zoomRef.current;
+
+    ctx.clearRect(0, 0, offscreen.width, offscreen.height);
+    ctx.save();
+    ctx.translate(ox, oy);
+    ctx.scale(zoom, zoom);
+
+    // Each shape is a solid unique color — no alpha, no stroke, no anti-aliasing artifacts.
+    for (const shape of currentShapes) {
+      const pickId = shapeToPickingRef.current.get(shape.id);
+      if (pickId === undefined) continue;
+      ctx.fillStyle = encodePickingColor(pickId);
+      roundedRect(ctx, shape.x, shape.y, shape.width, shape.height, 8);
+      ctx.fill();
+    }
+
+    ctx.restore();
+  }, []);
+
+  // ─── Main render ──────────────────────────────────────────────────────────
 
   const render = useCallback(() => {
     const canvas = canvasRef.current;
@@ -108,16 +181,14 @@ export default function CanvasNative() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.save();
     ctx.translate(ox, oy);
-    ctx.scale(zoom, zoom);  // world → screen: all subsequent draws are in world coords
+    ctx.scale(zoom, zoom);
 
-    // Draw all shapes sorted by zIndex, skipping the one being dragged
     const sorted = [...currentShapes].sort((a, b) => (a.zIndex || 0) - (b.zIndex || 0));
     for (const shape of sorted) {
       if (dragRef.current?.id === shape.id) continue;
       drawShape(ctx, shape, shape.x, shape.y, zoom);
     }
 
-    // Draw dragged shape on top with live world-space offset
     if (dragRef.current) {
       const { id, startShapeX, startShapeY, lastDx, lastDy } = dragRef.current;
       const shape = shapesById[id];
@@ -126,7 +197,6 @@ export default function CanvasNative() {
       }
     }
 
-    // Draw preview rect while in draw interaction
     if (drawRef.current) {
       const { pendingX, pendingY, pendingW, pendingH, color } = drawRef.current;
       if (pendingW > 0 && pendingH > 0) {
@@ -162,9 +232,18 @@ export default function CanvasNative() {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
+    // Create the offscreen picking canvas once, with willReadFrequently so the
+    // browser can optimise the backing store for frequent getImageData calls.
+    if (!offscreenRef.current) {
+      offscreenRef.current = document.createElement('canvas');
+      offscreenRef.current.getContext('2d', { willReadFrequently: true });
+    }
+
     const resize = () => {
       canvas.width = window.innerWidth;
       canvas.height = window.innerHeight;
+      offscreenRef.current!.width = canvas.width;
+      offscreenRef.current!.height = canvas.height;
       render();
     };
 
@@ -173,33 +252,34 @@ export default function CanvasNative() {
     return () => window.removeEventListener('resize', resize);
   }, [render]);
 
-  // Re-render when shapes are committed to the store
-  useEffect(() => {
-    render();
-  }, [shapes, render]);
+  useEffect(() => { render(); }, [shapes, render]);
 
-  // Sync cursor with mode
   useEffect(() => {
     const canvas = canvasRef.current;
     if (canvas) canvas.style.cursor = mode === 'draw' ? 'crosshair' : 'grab';
   }, [mode]);
 
-  // ─── Hit testing ──────────────────────────────────────────────────────────
+  // ─── Hit testing (O(1) color picking) ─────────────────────────────────────
 
   const getShapeAt = useCallback((clientX: number, clientY: number): Shape | null => {
-    const { shapes: currentShapes } = useCanvasStore.getState();
-    const { x: wx, y: wy } = toWorld(clientX, clientY);
+    const offscreen = offscreenRef.current;
+    if (!offscreen) return null;
+    const ctx = offscreen.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return null;
 
-    // Topmost first
-    const sorted = [...currentShapes].sort((a, b) => (b.zIndex || 0) - (a.zIndex || 0));
-    for (const shape of sorted) {
-      if (wx >= shape.x && wx <= shape.x + shape.width &&
-          wy >= shape.y && wy <= shape.y + shape.height) {
-        return shape;
-      }
-    }
-    return null;
-  }, [toWorld]);
+    // Render picking canvas on demand — only runs on mousedown, not every frame.
+    renderPicking();
+
+    // Read the single pixel at the click position — screen coords map directly.
+    const pixel = ctx.getImageData(clientX, clientY, 1, 1).data;
+    if (pixel[3] === 0) return null;  // alpha 0 = transparent background = no shape
+
+    const pickId = decodePickingColor(pixel[0], pixel[1], pixel[2]);
+    const shapeId = pickingMapRef.current.get(pickId);
+    if (!shapeId) return null;
+
+    return useCanvasStore.getState().shapesById[shapeId] ?? null;
+  }, [renderPicking]);
 
   // ─── Wheel (zoom) ─────────────────────────────────────────────────────────
 
@@ -210,9 +290,6 @@ export default function CanvasNative() {
     const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
     const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, oldZoom * factor));
 
-    // Keep the world point under the cursor stationary:
-    // screen = offset + world * zoom  →  newOffset = cursor - world * newZoom
-    //                                             = cursor - (cursor - offset) * (newZoom / oldZoom)
     const ratio = newZoom / oldZoom;
     canvasOffsetRef.current.x = e.clientX - (e.clientX - canvasOffsetRef.current.x) * ratio;
     canvasOffsetRef.current.y = e.clientY - (e.clientY - canvasOffsetRef.current.y) * ratio;
@@ -224,7 +301,6 @@ export default function CanvasNative() {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    // passive: false so we can call preventDefault and block browser page-zoom
     canvas.addEventListener('wheel', handleWheel, { passive: false });
     return () => canvas.removeEventListener('wheel', handleWheel);
   }, [handleWheel]);
@@ -239,7 +315,6 @@ export default function CanvasNative() {
       if (currentMode === 'draw') {
         const { x: startX, y: startY } = toWorld(e.clientX, e.clientY);
         const color = getRandomColor();
-
         drawRef.current = {
           id: `shape-${Date.now()}`,
           startX, startY, color,
@@ -258,8 +333,6 @@ export default function CanvasNative() {
             lastDy: 0,
           };
           if (canvas) canvas.style.cursor = 'grabbing';
-
-          // Bring dragged shape to front
           const { maxZIndex } = useCanvasStore.getState();
           updateShape(shape.id, { zIndex: maxZIndex + 1 });
         } else {
@@ -274,22 +347,18 @@ export default function CanvasNative() {
   const handleMouseMove = useCallback(
     (e: MouseEvent) => {
       if (dragRef.current) {
-        // Divide screen-space delta by zoom to get world-space delta
         const zoom = zoomRef.current;
         dragRef.current.lastDx = (e.clientX - dragRef.current.startCursorX) / zoom;
         dragRef.current.lastDy = (e.clientY - dragRef.current.startCursorY) / zoom;
         scheduleRender();
-
       } else if (drawRef.current) {
         const { startX, startY } = drawRef.current;
         const { x: wx, y: wy } = toWorld(e.clientX, e.clientY);
-
         drawRef.current.pendingX = Math.min(wx, startX);
         drawRef.current.pendingY = Math.min(wy, startY);
         drawRef.current.pendingW = Math.abs(wx - startX);
         drawRef.current.pendingH = Math.abs(wy - startY);
         scheduleRender();
-
       } else if (panRef.current) {
         canvasOffsetRef.current.x += e.clientX - panRef.current.lastX;
         canvasOffsetRef.current.y += e.clientY - panRef.current.lastY;
@@ -313,13 +382,11 @@ export default function CanvasNative() {
         cancelAnimationFrame(rafRef.current);
         rafRef.current = null;
       }
-
       const { id, color, pendingX: x, pendingY: y, pendingW: w, pendingH: h } = drawRef.current;
       if (w > 5 && h > 5) {
         const { maxZIndex } = useCanvasStore.getState();
         addShape({ id, type: 'rectangle', x, y, width: w, height: h, color, zIndex: maxZIndex + 1 });
       }
-
       drawRef.current = null;
       setMode('pan');
       render();
@@ -332,7 +399,6 @@ export default function CanvasNative() {
     }
   }, [addShape, updateShape, setMode, render]);
 
-  // Global listeners
   useEffect(() => {
     document.addEventListener('mousemove', handleMouseMove);
     document.addEventListener('mouseup', handleMouseUp);
