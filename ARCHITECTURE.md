@@ -13,6 +13,15 @@
    - [Drag](#73-drag-flow)
    - [Zoom (CanvasNative only)](#74-zoom-flow-canvasnative-only)
 8. [Performance Design](#8-performance-design)
+   - [Two-tier update model](#the-two-tier-update-model)
+   - [rAF throttling](#requestanimationframe-throttling)
+   - [Stale closure avoidance](#stale-closure-avoidance)
+   - [Sorted shapes array](#sorted-shapes-array-no-per-frame-sort)
+   - [Viewport culling](#viewport-culling)
+   - [Color picking hit test](#color-picking-hit-test-o1)
+   - [Picking dirty flag](#picking-dirty-flag)
+   - [Zustand subscribe — no React re-render](#zustand-subscribe--no-react-re-render-on-shapes-change)
+   - [DOM renderer specifics](#dom-renderer-specific-per-shape-isolation)
 9. [Minimap](#9-minimap)
 10. [Toolbar](#10-toolbar)
 
@@ -63,18 +72,20 @@ App  →  Toolbar
 
 ```typescript
 interface Shape {
-  id: string;       // "shape-<timestamp>", unique
+  id: string;       // "shape-<timestamp>", unique per session
   type: 'rectangle';
   x: number;        // world-space left edge
   y: number;        // world-space top edge
   width: number;    // world-space width
   height: number;   // world-space height
   color: string;    // hex color string
-  zIndex: number;   // paint order, higher = on top
+  zIndex: number;   // paint order, higher = on top; always increases
 }
 ```
 
 All positions are stored in **world space** — independent of the current pan offset or zoom level. The renderer applies the transform at draw time.
+
+**ID generation:** `shape-${Date.now()}` at draw-start (mousedown). Millisecond precision is sufficient since a full mousedown→mouseup cycle is required per shape. Use `crypto.randomUUID()` for stricter uniqueness guarantees.
 
 ---
 
@@ -84,34 +95,56 @@ All positions are stored in **world space** — independent of the current pan o
 
 ```typescript
 interface CanvasState {
-  shapes: Shape[];   // committed shape array
-  mode: Mode;        // 'pan' | 'draw'
-  updateShapes(updater: (prev: Shape[]) => Shape[]): void;
+  shapes: Map<string, Shape>;  // insertion-order = zIndex order; O(1) lookup by id
+  maxZIndex: number;           // current maximum zIndex
+  mode: 'pan' | 'draw';
+
+  addShape(shape: Shape): void;
+  updateShape(id: string, updates: Partial<Shape>): void;
   setMode(mode: Mode): void;
   resetCanvas(): void;
 }
 ```
 
-Built with **Zustand**. Key design choices:
+Built with **Zustand**.
 
 ### Why Zustand
-- Components subscribe to only the slices they need (`state.shapes`, `state.mode`), so unrelated changes don't cause re-renders.
-- `useCanvasStore.getState()` gives synchronous access to the latest state inside event handlers **without subscribing**. This is the primary way high-frequency handlers (mousemove, wheel) avoid stale closures without creating new handler instances on every state change.
+- Components subscribe to only the slices they need, so unrelated changes don't cause re-renders.
+- `useCanvasStore.getState()` gives synchronous access to the latest state inside event handlers **without subscribing** — the primary way high-frequency handlers avoid stale closures without recreating on every state change.
+- `useCanvasStore.subscribe()` lets non-React code (imperative canvas redraws) react to state changes without triggering a React render at all.
+
+### One structure, two roles
+
+`shapes: Map<string, Shape>` replaces the previous `shapes: Shape[]` + `shapesById: Record<string, Shape>` pair.
+
+| Operation | Mechanism | Complexity |
+|---|---|---|
+| Lookup by id | `shapes.get(id)` | O(1) |
+| Render iteration | `shapes.values()` in insertion order | O(n) |
+| Add shape | `shapes.set(id, shape)` | O(1) |
+| Update position | `shapes.set(id, updated)` — preserves insertion order | O(1) |
+| Update zIndex (bring to front) | `shapes.delete(id); shapes.set(id, updated)` — moves to end | O(1) |
+| Max zIndex | `maxZIndex` field | O(1) |
+
+Previously `updateShape` was O(n) — it had to `Array.filter` or `Array.map` over all shapes plus spread a full `shapesById` object copy. Now every mutation is O(1).
+
+### Maintaining sort order
+`zIndex` only ever increases (always assigned `maxZIndex + 1`). JavaScript `Map` preserves insertion order by spec. So:
+- `addShape` — `map.set(id, shape)` appends to end (always the highest zIndex).
+- `updateShape` with new zIndex — `map.delete(id); map.set(id, updated)` moves the entry to the end.
+- `updateShape` position-only — `map.set(id, updated)` overwrites in-place, order unchanged.
+
+`render()` calls `shapes.values()` directly — no sort ever runs at draw time.
 
 ### What is NOT in the store
-Pan offset, zoom level, and all in-progress interaction data live in **refs**, not the store:
+Pan offset, zoom level, and all in-progress interaction data live in **refs** — not in the store:
 
 | Data | Where | Why |
 |---|---|---|
-| `canvasOffsetRef` | ref | Mutated every mouse-move frame; putting it in the store would trigger re-renders 60+ times/second |
+| `canvasOffsetRef` | ref | Mutated every mousemove frame — store would trigger 60+ renders/sec |
 | `zoomRef` | ref | Same reason |
-| `dragRef`, `panRef`, `drawRef` | refs | Transient interaction state; only the final committed result belongs in the store |
-
-### updateShapes
-The `updateShapes` action accepts a functional updater `(prev) => next`. This pattern:
-- Avoids stale closure issues (the updater always receives the current state)
-- Allows batching-friendly updates
-- Keeps the shape array immutable — only the modified shape gets a new object reference, which matters for `React.memo` in the DOM renderer
+| `dragRef`, `panRef`, `drawRef` | refs | Transient; only the final committed result belongs in the store |
+| Picking canvas state | refs | Renderer implementation detail, not app state |
 
 ---
 
@@ -120,29 +153,30 @@ The `updateShapes` action accepts a functional updater `(prev) => next`. This pa
 ### Canvas.tsx — DOM Renderer
 Uses a `<div>` tree. Each shape is its own `<div>` (`ShapeItem`). The canvas-content div is translated via `style.transform`.
 
-- **Strengths:** Each shape is its own DOM node, so React's reconciler handles individual shape updates efficiently. `React.memo` prevents unmodified shapes from re-rendering during drag.
-- **Drag technique:** CSS `transform: translate(dx, dy)` is applied imperatively to the dragged shape's DOM element, bypassing React entirely until mouseup.
-- **Draw preview:** Uses a zero-size `<svg>` with `overflow: visible` containing a `<rect>`. Updating SVG geometry attributes (`x`, `y`, `width`, `height`) avoids triggering HTML layout entirely — unlike changing `style.width`/`style.height` on a div.
-- **No zoom support** in this implementation.
+- **Strengths:** Each shape is its own DOM node — React's reconciler handles individual shape updates efficiently. `React.memo` prevents unmodified shapes from re-rendering during drag.
+- **Drag technique:** CSS `transform: translate(dx, dy)` applied imperatively to the dragged DOM element, bypassing React entirely until mouseup.
+- **Draw preview:** A zero-size `<svg overflow="visible">` containing a `<rect>`. SVG geometry attribute changes (`x`, `y`, `width`, `height`) don't trigger HTML layout — unlike `style.width/height` on a div.
+- **Hit testing:** Free — browser routes events to the correct div automatically.
+- **No zoom support.**
 
 ### CanvasNative.tsx — HTML Canvas Renderer (active)
 Uses a single `<canvas>` element. Everything is drawn imperatively via the 2D Context API.
 
-- **Strengths:** All rendering is one `clearRect` + redraw loop. Supports zoom natively via `ctx.scale`. No DOM nodes per shape means no browser layout or style recalc overhead at any scale.
-- **Weakness:** Requires manual hit-testing to find which shape the user clicked (no browser event routing per shape).
+- **Strengths:** Single `clearRect` + redraw loop. Zoom via `ctx.scale`. No DOM nodes per shape means no layout/style-recalc overhead at any scale.
+- **Hit testing:** Manual — requires color picking (see §8).
 - **Zoom support:** Full scroll-wheel zoom with zoom-toward-cursor math.
 
 ---
 
 ## 6. Coordinate System
 
-Two spaces are used throughout the code:
+Two spaces are used throughout:
 
 ### Screen space (client coordinates)
-Raw pixel coordinates from mouse/touch events (`e.clientX`, `e.clientY`). Origin is the top-left of the browser viewport.
+Raw pixel coordinates from mouse/touch events (`e.clientX`, `e.clientY`). Origin at the top-left of the browser viewport.
 
 ### World space
-The infinite canvas coordinate system where shapes are stored. Shapes' `x`, `y`, `width`, `height` are all in world space.
+The infinite canvas coordinate system. All shape data is stored here.
 
 ### The transform
 ```
@@ -150,10 +184,10 @@ screen = offset + world × zoom
 world  = (screen − offset) / zoom
 ```
 
-- `canvasOffsetRef.current` = `{ x, y }` — where world origin maps to on screen.
-- `zoomRef.current` = current zoom level (default `1`).
+- `canvasOffsetRef.current` — where world origin maps to on screen.
+- `zoomRef.current` — current zoom level (default `1`).
 
-**`toWorld` helper (CanvasNative):**
+**`toWorld` helper:**
 ```typescript
 const toWorld = (screenX, screenY) => ({
   x: (screenX - offset.x) / zoom,
@@ -161,13 +195,13 @@ const toWorld = (screenX, screenY) => ({
 });
 ```
 
-This is called any time a mouse position needs to become a world position: draw start, draw move, hit testing.
+Used at draw start, draw move, and hit testing — anywhere a mouse position needs to become a world position.
 
 **In render:**
 ```typescript
 ctx.translate(offset.x, offset.y);
 ctx.scale(zoom, zoom);
-// now draw shapes at their world-space x, y
+// draw shapes at their world-space x, y
 ```
 
 ---
@@ -178,270 +212,206 @@ ctx.scale(zoom, zoom);
 
 **Trigger:** mousedown on empty canvas area in pan mode, or single-finger touch.
 
-#### Step by step
+1. **mousedown** → no shape at cursor → `panRef.current = { lastX, lastY }`, cursor `grabbing`.
+2. **mousemove** → accumulate delta into `canvasOffsetRef`, mark picking dirty, `scheduleRender()`.
+3. **mouseup** → `panRef.current = null`, cursor `grab`.
 
-1. **mousedown** → `handleMouseDown` detects no shape under cursor, sets:
-   ```typescript
-   panRef.current = { lastX: e.clientX, lastY: e.clientY };
-   canvas.style.cursor = 'grabbing';
-   ```
-
-2. **mousemove** (attached to `document`) → `handleMouseMove`:
-   ```typescript
-   canvasOffsetRef.current.x += e.clientX - panRef.current.lastX;
-   canvasOffsetRef.current.y += e.clientY - panRef.current.lastY;
-   panRef.current.lastX = e.clientX;
-   panRef.current.lastY = e.clientY;
-   scheduleRender();  // CanvasNative: rAF-throttled redraw
-   ```
-   The offset is a raw accumulation of mouse deltas — no math required because pan is a direct 1:1 translation in screen space.
-
-   In the **DOM renderer**, instead of `scheduleRender()`, `applyCanvasTransform()` is called which writes `style.transform` directly on the content div.
-
-3. **mouseup** → `handleMouseUp`:
-   ```typescript
-   panRef.current = null;
-   canvas.style.cursor = 'grab';
-   ```
-   No store update — pan offset lives entirely in `canvasOffsetRef`.
-
-#### Performance
-Pan **never touches React state or the Zustand store**. It is purely:
-- ref mutation (`canvasOffsetRef`)
-- one DOM write per frame (`ctx.clearRect` + redraw, or `style.transform` in DOM renderer)
-
-This is why panning is smooth regardless of how many shapes exist.
+**Zero store writes.** Pan lives entirely in `canvasOffsetRef`.
 
 ---
 
 ### 7.2 Draw Flow
 
-**Trigger:** Click "Create" button → mode becomes `'draw'` → mousedown on canvas.
+**Trigger:** "Create" button → mode `'draw'` → mousedown on canvas.
 
-#### Step by step
+1. **mousedown** → convert cursor to world coords via `toWorld`, populate `drawRef.current` with start position, assigned id and color.
+2. **mousemove** → update `drawRef.current.pending*` bounds each event; `scheduleRender()` queues one canvas draw per frame showing the dashed preview rect.
+3. **mouseup**:
+   - Rejects if `w ≤ 5 || h ≤ 5` (accidental click).
+   - Calls `addShape({ ..., zIndex: maxZIndex + 1 })` — **one store write**.
+   - Calls `setMode('pan')` — returns to pan mode automatically.
 
-1. **Toolbar "Create" click** → `setMode('draw')` → store updates, cursor becomes `crosshair`.
-
-2. **mousedown** → `handleMouseDown` detects mode is `'draw'`, converts cursor to world coordinates:
-   ```typescript
-   const { x: startX, y: startY } = toWorld(e.clientX, e.clientY);
-   drawRef.current = {
-     id: `shape-${Date.now()}`,
-     startX, startY,
-     color: getRandomColor(),
-     pendingX: startX, pendingY: startY, pendingW: 0, pendingH: 0,
-   };
-   ```
-   In the DOM renderer, the SVG `<rect>` preview is made visible and positioned at the start point.
-
-3. **mousemove** → `handleMouseMove` updates the pending bounds in world space:
-   ```typescript
-   const { x: wx, y: wy } = toWorld(e.clientX, e.clientY);
-   drawRef.current.pendingX = Math.min(wx, startX);
-   drawRef.current.pendingY = Math.min(wy, startY);
-   drawRef.current.pendingW = Math.abs(wx - startX);
-   drawRef.current.pendingH = Math.abs(wy - startY);
-   scheduleRender();
-   ```
-   `min`/`abs` normalisation means you can drag in any direction — top-left, top-right, bottom-left, bottom-right — and always get a valid rect.
-
-   In `render()`, if `drawRef.current` exists, the preview rectangle is drawn with dashed stroke and 30% fill opacity.
-
-4. **mouseup** → `handleMouseUp`:
-   - Cancels any pending rAF.
-   - Checks minimum size (`w > 5 && h > 5`) to reject accidental clicks.
-   - Commits to the store:
-     ```typescript
-     updateShapes(prev => [...prev, {
-       id, type: 'rectangle', x, y, width: w, height: h, color,
-       zIndex: maxZ + 1   // always on top of existing shapes
-     }]);
-     ```
-   - Clears `drawRef.current`.
-   - Calls `setMode('pan')` — automatically returns to pan mode.
-
-#### Performance
-During the drag, **nothing is written to React state or the store**. Only `drawRef` is mutated and `scheduleRender()` queues one canvas redraw per display frame. The store write happens exactly once on mouseup.
+**One store write** on mouseup. Nothing written during drag.
 
 ---
 
 ### 7.3 Drag Flow
 
-**Trigger:** mousedown directly on an existing shape in pan mode.
+**Trigger:** mousedown on an existing shape in pan mode.
 
-#### Step by step
+1. **mousedown on shape** → `getShapeAt` returns the shape via color picking (O(1)):
+   - Populates `dragRef.current` with start cursor and start world position.
+   - Calls `updateShape(id, { zIndex: maxZIndex + 1 })` — **first store write** (bring to front, moves shape to end of sorted array).
 
-1. **mousedown on shape** → `handleMouseDown` (CanvasNative) or `handleShapeMouseDown` (DOM renderer):
-   - Hit-tests to find the shape under the cursor (CanvasNative: manual AABB loop; DOM: event bubbles from the shape's own `onMouseDown`).
-   - Records the start state in world space:
-     ```typescript
-     dragRef.current = {
-       id: shape.id,
-       startCursorX: e.clientX,   // screen space
-       startCursorY: e.clientY,
-       startShapeX: shape.x,      // world space
-       startShapeY: shape.y,
-       lastDx: 0, lastDy: 0,      // world-space deltas, updated each move
-     };
-     ```
-   - Immediately commits a zIndex increment to the store so the shape renders on top:
-     ```typescript
-     updateShapes(prev => {
-       const maxZ = prev.reduce((m, s) => Math.max(m, s.zIndex), 0);
-       return prev.map(s => s.id === id ? { ...s, zIndex: maxZ + 1 } : s);
-     });
-     ```
-
-   In the **DOM renderer**, the shape's DOM element also gets `will-change: transform` and a `dragging` CSS class applied imperatively (thicker border, shadow).
-
-2. **mousemove** → `handleMouseMove`:
+2. **mousemove**:
    ```typescript
-   // Divide screen delta by zoom → world-space delta
-   dragRef.current.lastDx = (e.clientX - startCursorX) / zoom;
+   dragRef.current.lastDx = (e.clientX - startCursorX) / zoom;  // world-space delta
    dragRef.current.lastDy = (e.clientY - startCursorY) / zoom;
    scheduleRender();
    ```
-   In `render()`, the dragged shape is skipped in the normal paint pass, then drawn last (on top) at `startShapeX + lastDx`, `startShapeY + lastDy` with a white border to indicate active drag.
+   In `render()`, the dragged shape is skipped in the main loop then drawn last at `startShapeX + lastDx/Dy` with a white border. **No store writes.**
 
-   In the **DOM renderer**: `el.style.transform = 'translate(dx, dy)'` is applied directly — no React, no store.
+3. **mouseup** → `updateShape(id, { x: startShapeX + lastDx, y: startShapeY + lastDy })` — **second store write** (commit final position).
 
-3. **mouseup** → `handleMouseUp`:
-   - Commits the final world-space position:
-     ```typescript
-     updateShapes(prev => prev.map(s =>
-       s.id === id
-         ? { ...s, x: startShapeX + lastDx, y: startShapeY + lastDy }
-         : s
-     ));
-     ```
-   - Clears `dragRef.current`.
-   - In the DOM renderer: removes `transform`, `will-change`, and `dragging` class from the element.
+**Two store writes total** per drag (mousedown + mouseup). Hundreds of mousemove events produce zero store writes.
 
-#### Why divide by zoom
-Screen delta / zoom = world delta. Without this correction, dragging at zoom=2 would move the shape at double the cursor speed — the shape would appear to slide out from under the cursor.
-
-#### Performance
-The store is written **twice** per drag: once on mousedown (zIndex) and once on mouseup (final position). During the entire drag motion — which can be hundreds of mousemove events — no state is written anywhere. Only `dragRef.lastDx/lastDy` are mutated and the canvas is redrawn per frame.
+#### Why divide delta by zoom
+Screen delta / zoom = world delta. Without this, dragging at zoom=2 would move the shape at double cursor speed.
 
 ---
 
 ### 7.4 Zoom Flow (CanvasNative only)
 
-**Trigger:** scroll wheel on the canvas element.
+**Trigger:** scroll wheel (`{ passive: false }` to allow `preventDefault`).
 
-#### Step by step
+1. Compute new zoom: `oldZoom × 1.1` (in) or `× 1/1.1` (out), clamped to `[0.05, 20]`.
+2. Adjust offset to keep the world point under the cursor stationary:
+   ```
+   newOffset = cursor − (cursor − oldOffset) × (newZoom / oldZoom)
+   ```
+3. Update `zoomRef`, mark picking dirty, `scheduleRender()`.
 
-1. **wheel event** → `handleWheel` (registered with `{ passive: false }` to allow `preventDefault`):
-
-   a. Compute new zoom level:
-   ```typescript
-   const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;  // scroll up = zoom in
-   const newZoom = clamp(oldZoom * factor, MIN_ZOOM=0.05, MAX_ZOOM=20);
-   ```
-   Multiplicative steps (10% per tick) give perceptually uniform zoom — the same number of scroll ticks takes you from 1× to 2× as from 2× to 4×.
-
-   b. Adjust offset to keep the world point under the cursor fixed:
-   ```typescript
-   const ratio = newZoom / oldZoom;
-   offset.x = cursor.x - (cursor.x - offset.x) * ratio;
-   offset.y = cursor.y - (cursor.y - offset.y) * ratio;
-   ```
-   **Derivation:** The world point under the cursor must satisfy:
-   ```
-   screen = offset + world × zoom
-   world  = (screen − offset) / zoom
-   ```
-   After zoom, for the same world point to appear at the same screen position:
-   ```
-   world_old = (cursor − oldOffset) / oldZoom
-   newOffset = cursor − world_old × newZoom
-             = cursor − (cursor − oldOffset) × (newZoom / oldZoom)
-   ```
-
-   c. Commit and redraw:
-   ```typescript
-   zoomRef.current = newZoom;
-   scheduleRender();
-   ```
-
-2. **render()** applies `ctx.scale(zoom, zoom)` after the translate, so all subsequent shape draws are automatically in the right screen position.
+**Zero store writes.**
 
 #### Line width correction
-`ctx.scale(zoom, zoom)` scales everything — including stroke width. A `lineWidth = 2` at zoom=3 would render as 6px on screen. To keep borders visually constant:
-```typescript
-ctx.lineWidth = 2 / zoom;
-```
-This cancels out the scale factor, giving a consistent 2px border at all zoom levels.
-
-#### Performance
-Zoom **never touches the store**. `zoomRef` and `canvasOffsetRef` are mutated, `scheduleRender()` queues one canvas frame. The entire zoom interaction is zero React renders.
+`ctx.scale(zoom)` scales stroke width too. `lineWidth = 2 / zoom` cancels this out — borders are always 2px on screen regardless of zoom level. Same applied to dash pattern.
 
 ---
 
 ## 8. Performance Design
 
-The central principle: **React state is expensive; refs and imperative DOM/canvas writes are cheap**. The architecture separates "data that drives React renders" from "data that changes every frame".
+The central principle: **React renders are expensive; ref mutations and imperative canvas draws are cheap.** The architecture strictly separates "data that must drive React renders" from "data that changes every frame."
+
+---
 
 ### The two-tier update model
 
-| Tier | Mechanism | When used |
+| Tier | Mechanism | Frequency |
 |---|---|---|
-| **Committed state** | Zustand store → React re-render | Shape added, shape position finalised, mode changed |
-| **In-flight state** | Ref mutation + canvas redraw / DOM write | Every mousemove during pan, drag, draw, and zoom |
+| **Committed state** | `addShape` / `updateShape` → Zustand → React | Once per interaction (mousedown or mouseup) |
+| **In-flight state** | Ref mutation + `scheduleRender()` | Every mousemove / wheel event |
 
-A drag interaction may produce 300 mousemove events between mousedown and mouseup. Without this separation, each event would trigger a React re-render and cause all shapes to be re-processed by the reconciler.
+---
 
 ### requestAnimationFrame throttling
 
-`scheduleRender()` in CanvasNative:
+`scheduleRender()` guarantees at most one canvas redraw per display frame:
 ```typescript
-const scheduleRender = () => {
-  if (rafRef.current !== null) return;   // already scheduled, skip
-  rafRef.current = requestAnimationFrame(() => {
-    rafRef.current = null;
-    render();
-  });
-};
+if (rafRef.current !== null) return;   // already queued
+rafRef.current = requestAnimationFrame(() => {
+  rafRef.current = null;
+  render();
+});
 ```
-On a 1000 Hz mouse at 60 fps display, ~16 mousemove events arrive per frame. Without this throttle, each would call `render()` redundantly. The rAF guard means only the **last** event's data is drawn, once per frame, at the display's natural refresh rate.
+On a 1000 Hz mouse at 60 fps, ~16 mousemove events arrive per frame. Without this guard, each would call `render()`. Instead, `drawRef`/`dragRef` are updated on every event (data always current), but the draw is batched to the next frame boundary.
 
-The actual pending bounds (`drawRef.pendingX/Y/W/H`) and drag delta (`dragRef.lastDx/Dy`) are updated on every mousemove — data is always current — but the canvas draw is deferred to the next frame boundary.
+---
 
 ### Stale closure avoidance
 
-Event handlers registered with `useCallback` and attached once via `useEffect` cannot close over React state directly, because state captured at registration time becomes stale as the store updates. Two strategies are used:
+Handlers registered once via `useEffect` cannot close over React state — it becomes stale. Two strategies:
 
-1. **`useCanvasStore.getState()`** — synchronous read of current Zustand state without subscribing. Used anywhere a handler needs the latest `mode` or `shapes` without causing the handler itself to be recreated:
+1. **`useCanvasStore.getState()`** — synchronous read of the current store state, no subscription:
    ```typescript
    const handleMouseDown = useCallback((e) => {
-     const { mode } = useCanvasStore.getState();  // always current
+     const { mode, maxZIndex } = useCanvasStore.getState();
      ...
-   }, []);  // no mode dependency — handler never recreated
+   }, []);  // empty deps — handler is stable forever
    ```
 
-2. **Refs as mirrors** — in the DOM renderer (`useCanvasInteractions`), `canvasOffsetRef` mirrors the pan offset. The handlers read `canvasOffsetRef.current` rather than closing over a state variable.
+2. **Refs** — `canvasOffsetRef`, `zoomRef`, `dragRef`, etc. are always current because they're mutated in-place, not re-assigned.
+
+---
+
+### Sorted Map — no per-frame sort
+
+`shapes: Map<string, Shape>` is maintained in zIndex order as an invariant (see §4). Since zIndex only ever increases:
+- `addShape` — `map.set` appends to end.
+- `updateShape` with new zIndex — `map.delete` + `map.set` moves to end.
+
+`render()` calls `shapes.values()` directly — **no sort, no array copy per frame.** Previously this was O(n log n) sort + O(n) array copy on every frame.
+
+---
+
+### Viewport culling
+
+Before drawing any shape, `isVisible()` checks if its AABB intersects the current viewport in world space:
+
+```typescript
+const viewMinX = -offsetX / zoom;
+const viewMaxX = viewMinX + canvasW / zoom;
+// same for Y...
+return shape.x + shape.width > viewMinX && shape.x < viewMaxX && ...
+```
+
+Applied in both `render()` and `renderPicking()`. Shapes entirely outside the viewport are skipped — constant time per shape, significant saving when panned far from a dense cluster.
+
+---
+
+### Color picking hit test — O(1)
+
+The `<canvas>` API has no event routing per shape. The naive approach — iterating all shapes in reverse zIndex order to find which one contains the click — is O(n).
+
+**Solution:** a hidden offscreen canvas rendered with one solid unique color per shape. On mousedown, `getImageData(x, y, 1, 1)` reads the single pixel under the cursor and decodes it back to a shape id.
+
+```
+integer pickingId → rgb(r, g, b)    encode: r=(id>>16)&0xff, g=(id>>8)&0xff, b=id&0xff
+pixel rgba        → integer pickingId    decode: (r<<16)|(g<<8)|b
+pickingId         → shapeId              O(1) Map lookup
+shapeId           → Shape                O(1) shapesById[id]
+```
+
+The offscreen canvas uses `willReadFrequently: true` at context creation so the browser optimises the backing store for `getImageData`.
+
+**Why a separate canvas?** The main canvas uses `globalAlpha`, strokes, and anti-aliasing — all of which corrupt the pixel color. The picking canvas draws shapes as opaque solid fills only, so every pixel decodes cleanly.
+
+---
+
+### Picking dirty flag
+
+The picking canvas only needs to be current at mousedown time, not on every frame. A `pickingDirtyRef` boolean tracks whether a redraw is needed:
+
+```typescript
+// Marked true when:
+//   - shapes change (added, moved, reset)   ← useCanvasStore.subscribe
+//   - pan offset changes                    ← handleMouseMove pan branch
+//   - zoom changes                          ← handleWheel
+//   - canvas resized                        ← resize handler
+
+// renderPicking() skips the draw if false, sets to false after drawing.
+```
+
+A series of rapid clicks with no movement between them redraws the picking canvas exactly once.
+
+---
+
+### Zustand subscribe — no React re-render on shapes change
+
+`CanvasNative` needs to redraw when shapes change, but its JSX output (`<canvas>`, `<Minimap>`) doesn't depend on `shapes` at all. Subscribing via `useCanvasStore(state => state.shapes)` would cause a full React component re-render on every shape commit — just to call an imperative function.
+
+**Solution:** `useCanvasStore.subscribe()` instead:
+```typescript
+useEffect(() => {
+  return useCanvasStore.subscribe((state, prev) => {
+    if (state.shapes === prev.shapes) return;  // new Map instance = changed
+    // sync picking IDs, mark dirty, call render()
+  });
+}, [render]);
+```
+
+The `===` reference check works because every store update creates a `new Map(...)` — the reference changes even if the contents are the same shape.
+
+The callback runs synchronously inside Zustand when the store updates — no React scheduler, no component re-render, no reconciliation. `CanvasNative` now only re-renders when `mode` changes (toolbar click or draw completion), which is rare.
+
+---
 
 ### DOM renderer specific: per-shape isolation
 
-In `Canvas.tsx`, each shape is a `React.memo`-wrapped `ShapeItem`. During a drag:
-- Only the dragged shape gets a new object reference in the store (zIndex increment on mousedown, position commit on mouseup).
-- `React.memo` ensures all other shapes are skipped during reconciliation.
-- Visual movement during the drag is applied with `element.style.transform` directly on the DOM node — React never sees it.
-- `will-change: transform` is set imperatively on drag start and removed on drag end, promoting the element to its own GPU compositing layer only for the duration of the drag.
-
-### Canvas renderer specific: z-order draw loop
-
-The canvas renderer cannot skip drawing shapes (unlike DOM where unchanged divs are untouched by React). Every frame it redraws all shapes. To maintain correct stacking:
-```typescript
-const sorted = [...shapes].sort((a, b) => a.zIndex - b.zIndex);
-for (const shape of sorted) {
-  if (dragRef.current?.id === shape.id) continue;  // draw last
-  drawShape(ctx, shape, ...);
-}
-// draw dragged shape last → always on top visually
-if (dragRef.current) drawShape(ctx, draggedShape, dragged_x, dragged_y, isDragging=true);
-```
-Skipping and redrawing the dragged shape last is equivalent to the `zIndex: maxZ + 1` applied in the store, but at draw time without requiring a sort re-run.
+In `Canvas.tsx` each shape is `React.memo`-wrapped. During drag:
+- Only the dragged shape gets a new object reference (zIndex on mousedown, position on mouseup).
+- All other `ShapeItem`s are skipped by the reconciler.
+- Visual movement is `element.style.transform` — React never sees it.
+- `will-change: transform` is set on drag start and removed on drag end — GPU layer only for the duration of the drag.
 
 ---
 
@@ -449,36 +419,19 @@ Skipping and redrawing the dragged shape last is equivalent to the `zIndex: maxZ
 
 **File:** `src/components/Minimap.tsx`
 
-A 15% × 15% viewport-sized overview widget, fixed to the bottom-right corner. Draggable to reposition.
+A 15% × 15% viewport-sized overview, fixed bottom-right, draggable.
 
 ### How it renders
 
-1. **Content bounds** are calculated from the shapes array:
-   - Iterates all shapes to find `minX`, `maxX`, `minY`, `maxY`.
-   - Adds 200px padding on all sides.
-   - Expands to include the current viewport area (read from `canvasOffsetRef` — the viewport in world space spans `[-offset.x, -offset.x + viewportWidth]`).
-   - Falls back to a 3× viewport area when no shapes exist.
-
-2. **Scale factor:**
-   ```typescript
-   const minimapScale = Math.min(
-     minimapSize.width / contentBounds.width,
-     minimapSize.height / contentBounds.height
-   );
-   ```
-   Fits all content within the minimap box while preserving aspect ratio.
-
-3. **Shape rendering:** Each shape maps to a small `<div>` positioned with:
-   ```typescript
-   left: (shape.x - contentBounds.minX) * minimapScale
-   top:  (shape.y - contentBounds.minY) * minimapScale
-   width:  shape.width  * minimapScale
-   height: shape.height * minimapScale
-   ```
+1. **Content bounds** — iterates all shapes to find `minX/maxX/minY/maxY`, adds 200px padding, expands to include current viewport (read from `canvasOffsetRef`). Falls back to 3× viewport when no shapes exist.
+2. **Scale factor** — `min(minimapW / boundsW, minimapH / boundsH)` to fit all content while preserving aspect ratio.
+3. **Shape divs** — each shape is a `<div>` positioned at `(shape.x - minX) * scale`.
 
 ### Why canvasOffsetRef instead of a store value
+Minimap re-renders when `shapes` changes (Zustand subscription). If viewport position were in the store, every pan frame would re-render it 60×/sec. `canvasOffsetRef` is passed by ref — on the next shapes-triggered render, Minimap reads the current offset directly from the ref, including the viewport in its bounds calculation with zero extra renders.
 
-The minimap re-renders only when `shapes` changes (Zustand subscription). If the viewport position were in the store, every pan frame would re-render the minimap — 60 times/second. Instead, `canvasOffsetRef` is passed by reference: on the **next** shapes-triggered render, the minimap reads the current offset from the ref and includes the viewport in its content bounds calculation. The minimap's viewport indicator is therefore only updated when shapes change, not on every pan frame.
+### Shapes already sorted
+`shapes` from the store is maintained in zIndex order — Minimap iterates it directly with no sort.
 
 ---
 
@@ -486,11 +439,9 @@ The minimap re-renders only when `shapes` changes (Zustand subscription). If the
 
 **File:** `src/components/Toolbar.tsx`
 
-Two buttons, each reading directly from the Zustand store:
-
 | Button | Action |
 |---|---|
-| **Reset** | `resetCanvas()` — sets `shapes: []`, keeping mode unchanged |
-| **Create** | `setMode('draw')` — switches to draw mode; automatically returns to `'pan'` when the next shape is completed (or on mouseup in CanvasNative) |
+| **Reset** | `resetCanvas()` — clears `shapes`, `shapesById`, `maxZIndex` |
+| **Create** | `setMode('draw')` — mode returns to `'pan'` automatically on draw completion |
 
-`memo()` wraps the component so it only re-renders if its store subscriptions change. Since it subscribes to `setMode` and `resetCanvas` (action references, stable forever), it effectively **never re-renders** after mount.
+`memo()` wraps the component. It subscribes only to `setMode` and `resetCanvas` (stable action references) — effectively **never re-renders** after mount.

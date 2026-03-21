@@ -156,7 +156,7 @@ export default function CanvasNative() {
     ctx.scale(zoom, zoom);
 
     // Each shape is a solid unique color — no alpha, no stroke, no anti-aliasing artifacts.
-    for (const shape of currentShapes) {
+    for (const shape of currentShapes.values()) {
       if (!isVisible(shape, ox, oy, zoom, offscreen.width, offscreen.height)) continue;
       const pickId = shapeToPickingRef.current.get(shape.id);
       if (pickId === undefined) continue;
@@ -177,7 +177,7 @@ export default function CanvasNative() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const { shapes: currentShapes, shapesById } = useCanvasStore.getState();
+    const { shapes: currentShapes } = useCanvasStore.getState();
     const { x: ox, y: oy } = canvasOffsetRef.current;
     const zoom = zoomRef.current;
 
@@ -186,8 +186,8 @@ export default function CanvasNative() {
     ctx.translate(ox, oy);
     ctx.scale(zoom, zoom);
 
-    // shapes[] is maintained in zIndex order by the store — no sort needed.
-    for (const shape of currentShapes) {
+    // Map iteration order = insertion order = zIndex order — no sort needed.
+    for (const shape of currentShapes.values()) {
       if (dragRef.current?.id === shape.id) continue;
       if (!isVisible(shape, ox, oy, zoom, canvas.width, canvas.height)) continue;
       drawShape(ctx, shape, shape.x, shape.y, zoom);
@@ -195,7 +195,7 @@ export default function CanvasNative() {
 
     if (dragRef.current) {
       const { id, startShapeX, startShapeY, lastDx, lastDy } = dragRef.current;
-      const shape = shapesById[id];
+      const shape = currentShapes.get(id);
       if (shape) {
         drawShape(ctx, shape, startShapeX + lastDx, startShapeY + lastDy, zoom, true);
       }
@@ -262,14 +262,13 @@ export default function CanvasNative() {
     return useCanvasStore.subscribe((state, prev) => {
       if (state.shapes === prev.shapes) return;
 
-      const currentIds = new Set(state.shapes.map((s) => s.id));
       for (const [pickId, shapeId] of pickingMapRef.current) {
-        if (!currentIds.has(shapeId)) {
+        if (!state.shapes.has(shapeId)) {
           pickingMapRef.current.delete(pickId);
           shapeToPickingRef.current.delete(shapeId);
         }
       }
-      for (const shape of state.shapes) {
+      for (const shape of state.shapes.values()) {
         if (!shapeToPickingRef.current.has(shape.id)) {
           const pickId = nextPickingIdRef.current++;
           pickingMapRef.current.set(pickId, shape.id);
@@ -306,7 +305,7 @@ export default function CanvasNative() {
     const shapeId = pickingMapRef.current.get(pickId);
     if (!shapeId) return null;
 
-    return useCanvasStore.getState().shapesById[shapeId] ?? null;
+    return useCanvasStore.getState().shapes.get(shapeId) ?? null;
   }, [renderPicking]);
 
   // ─── Wheel (zoom) ─────────────────────────────────────────────────────────

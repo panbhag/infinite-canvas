@@ -18,7 +18,7 @@ const Minimap = memo(({ canvasOffsetRef, viewportSize }: MinimapProps) => {
   };
 
   const getContentBounds = () => {
-    if (shapes.length === 0) {
+    if (shapes.size === 0) {
       return {
         minX: -viewportSize.width,
         maxX: viewportSize.width * 2,
@@ -32,12 +32,12 @@ const Minimap = memo(({ canvasOffsetRef, viewportSize }: MinimapProps) => {
     let minX = Infinity, maxX = -Infinity;
     let minY = Infinity, maxY = -Infinity;
 
-    shapes.forEach((shape) => {
+    for (const shape of shapes.values()) {
       minX = Math.min(minX, shape.x);
       maxX = Math.max(maxX, shape.x + shape.width);
       minY = Math.min(minY, shape.y);
       maxY = Math.max(maxY, shape.y + shape.height);
-    });
+    }
 
     const padding = 200;
     minX -= padding;
@@ -114,7 +114,7 @@ const Minimap = memo(({ canvasOffsetRef, viewportSize }: MinimapProps) => {
         className="minimap"
         style={{ width: minimapSize.width, height: minimapSize.height }}
       >
-        {shapes.map((shape) => (
+        {[...shapes.values()].map((shape) => (
             <div
               key={shape.id}
               className={`minimap-shape minimap-shape-${shape.type}`}

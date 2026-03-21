@@ -4,10 +4,9 @@ import { Shape } from '../types';
 export type Mode = 'pan' | 'draw';
 
 interface CanvasState {
-  // Ordered array — used for rendering iteration and React subscriptions.
-  shapes: Shape[];
-  // O(1) lookup map — used wherever a single shape is needed by id.
-  shapesById: Record<string, Shape>;
+  // Map<id, Shape> — insertion order = zIndex order, so iteration is always sorted.
+  // Serves as both the render list and the O(1) id lookup (replaces a separate shapesById).
+  shapes: Map<string, Shape>;
   // Tracks current maximum zIndex — avoids an O(n) reduce on every interaction.
   maxZIndex: number;
   mode: Mode;
@@ -19,30 +18,30 @@ interface CanvasState {
 }
 
 export const useCanvasStore = create<CanvasState>((set) => ({
-  shapes: [],
-  shapesById: {},
+  shapes: new Map(),
   maxZIndex: 0,
   mode: 'pan',
 
   addShape: (shape) =>
-    set((state) => ({
-      shapes: [...state.shapes, shape],
-      shapesById: { ...state.shapesById, [shape.id]: shape },
-      maxZIndex: Math.max(state.maxZIndex, shape.zIndex),
-    })),
+    set((state) => {
+      const shapes = new Map(state.shapes);
+      shapes.set(shape.id, shape);
+      return { shapes, maxZIndex: Math.max(state.maxZIndex, shape.zIndex) };
+    }),
 
   updateShape: (id, updates) =>
     set((state) => {
-      const existing = state.shapesById[id];
+      const existing = state.shapes.get(id);
       if (!existing) return state;
       const updated = { ...existing, ...updates };
-      // When zIndex changes the shape becomes the highest — move it to the end
-      // so shapes[] stays sorted by zIndex without an explicit sort.
-      const shapes = updates.zIndex !== undefined
-        ? [...state.shapes.filter((s) => s.id !== id), updated]
-        : state.shapes.map((s) => (s.id === id ? updated : s));
+      const shapes = new Map(state.shapes);
+      if (updates.zIndex !== undefined) {
+        // Delete + re-insert moves the entry to the end of the Map's insertion order,
+        // keeping the Map sorted by zIndex without an explicit sort.
+        shapes.delete(id);
+      }
+      shapes.set(id, updated);
       return {
-        shapesById: { ...state.shapesById, [id]: updated },
         shapes,
         maxZIndex: updates.zIndex !== undefined
           ? Math.max(state.maxZIndex, updates.zIndex)
@@ -52,5 +51,5 @@ export const useCanvasStore = create<CanvasState>((set) => ({
 
   setMode: (mode) => set({ mode }),
 
-  resetCanvas: () => set({ shapes: [], shapesById: {}, maxZIndex: 0 }),
+  resetCanvas: () => set({ shapes: new Map(), maxZIndex: 0 }),
 }));
