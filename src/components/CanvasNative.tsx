@@ -58,6 +58,25 @@ function decodePickingColor(r: number, g: number, b: number): number {
   return (r << 16) | (g << 8) | b;
 }
 
+/** Returns true if the shape's AABB intersects the visible viewport (world space). */
+function isVisible(
+  shape: Shape,
+  offsetX: number, offsetY: number,
+  zoom: number,
+  canvasW: number, canvasH: number,
+): boolean {
+  const viewMinX =  -offsetX / zoom;
+  const viewMinY =  -offsetY / zoom;
+  const viewMaxX = viewMinX + canvasW / zoom;
+  const viewMaxY = viewMinY + canvasH / zoom;
+  return (
+    shape.x + shape.width  > viewMinX &&
+    shape.x                < viewMaxX &&
+    shape.y + shape.height > viewMinY &&
+    shape.y                < viewMaxY
+  );
+}
+
 // ─── Component ───────────────────────────────────────────────────────────────
 
 export default function CanvasNative() {
@@ -79,6 +98,8 @@ export default function CanvasNative() {
   // shapeId (string) → pickingId (integer)
   const shapeToPickingRef = useRef<Map<string, number>>(new Map());
   const nextPickingIdRef = useRef(1);
+  // true whenever the picking canvas needs a redraw before the next hit test
+  const pickingDirtyRef = useRef(true);
 
   // Assign a stable pickingId to every new shape; clean up removed ones.
   useEffect(() => {
@@ -139,6 +160,7 @@ export default function CanvasNative() {
 
   /** Redraws the offscreen picking canvas. Called at the end of every render(). */
   const renderPicking = useCallback(() => {
+    if (!pickingDirtyRef.current) return;  // already up to date, skip redraw
     const offscreen = offscreenRef.current;
     if (!offscreen) return;
     // willReadFrequently hint is set at context creation (in the resize effect).
@@ -156,6 +178,7 @@ export default function CanvasNative() {
 
     // Each shape is a solid unique color — no alpha, no stroke, no anti-aliasing artifacts.
     for (const shape of currentShapes) {
+      if (!isVisible(shape, ox, oy, zoom, offscreen.width, offscreen.height)) continue;
       const pickId = shapeToPickingRef.current.get(shape.id);
       if (pickId === undefined) continue;
       ctx.fillStyle = encodePickingColor(pickId);
@@ -164,6 +187,7 @@ export default function CanvasNative() {
     }
 
     ctx.restore();
+    pickingDirtyRef.current = false;
   }, []);
 
   // ─── Main render ──────────────────────────────────────────────────────────
@@ -183,9 +207,10 @@ export default function CanvasNative() {
     ctx.translate(ox, oy);
     ctx.scale(zoom, zoom);
 
-    const sorted = [...currentShapes].sort((a, b) => (a.zIndex || 0) - (b.zIndex || 0));
-    for (const shape of sorted) {
+    // shapes[] is maintained in zIndex order by the store — no sort needed.
+    for (const shape of currentShapes) {
       if (dragRef.current?.id === shape.id) continue;
+      if (!isVisible(shape, ox, oy, zoom, canvas.width, canvas.height)) continue;
       drawShape(ctx, shape, shape.x, shape.y, zoom);
     }
 
@@ -252,7 +277,10 @@ export default function CanvasNative() {
     return () => window.removeEventListener('resize', resize);
   }, [render]);
 
-  useEffect(() => { render(); }, [shapes, render]);
+  useEffect(() => {
+    pickingDirtyRef.current = true;
+    render();
+  }, [shapes, render]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -295,6 +323,7 @@ export default function CanvasNative() {
     canvasOffsetRef.current.y = e.clientY - (e.clientY - canvasOffsetRef.current.y) * ratio;
 
     zoomRef.current = newZoom;
+    pickingDirtyRef.current = true;
     scheduleRender();
   }, [scheduleRender]);
 
@@ -364,6 +393,7 @@ export default function CanvasNative() {
         canvasOffsetRef.current.y += e.clientY - panRef.current.lastY;
         panRef.current.lastX = e.clientX;
         panRef.current.lastY = e.clientY;
+        pickingDirtyRef.current = true;
         scheduleRender();
       }
     },
@@ -424,6 +454,7 @@ export default function CanvasNative() {
         canvasOffsetRef.current.y += e.touches[0].clientY - panRef.current.lastY;
         panRef.current.lastX = e.touches[0].clientX;
         panRef.current.lastY = e.touches[0].clientY;
+        pickingDirtyRef.current = true;
         scheduleRender();
       }
     },

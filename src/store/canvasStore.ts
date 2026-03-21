@@ -36,13 +36,17 @@ export const useCanvasStore = create<CanvasState>((set) => ({
       const existing = state.shapesById[id];
       if (!existing) return state;
       const updated = { ...existing, ...updates };
+      // When zIndex changes the shape becomes the highest — move it to the end
+      // so shapes[] stays sorted by zIndex without an explicit sort.
+      const shapes = updates.zIndex !== undefined
+        ? [...state.shapes.filter((s) => s.id !== id), updated]
+        : state.shapes.map((s) => (s.id === id ? updated : s));
       return {
         shapesById: { ...state.shapesById, [id]: updated },
-        shapes: state.shapes.map((s) => (s.id === id ? updated : s)),
-        maxZIndex:
-          updates.zIndex !== undefined
-            ? Math.max(state.maxZIndex, updates.zIndex)
-            : state.maxZIndex,
+        shapes,
+        maxZIndex: updates.zIndex !== undefined
+          ? Math.max(state.maxZIndex, updates.zIndex)
+          : state.maxZIndex,
       };
     }),
 

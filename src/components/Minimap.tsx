@@ -114,9 +114,7 @@ const Minimap = memo(({ canvasOffsetRef, viewportSize }: MinimapProps) => {
         className="minimap"
         style={{ width: minimapSize.width, height: minimapSize.height }}
       >
-        {[...shapes]
-          .sort((a, b) => (a.zIndex || 0) - (b.zIndex || 0))
-          .map((shape) => (
+        {shapes.map((shape) => (
             <div
               key={shape.id}
               className={`minimap-shape minimap-shape-${shape.type}`}
