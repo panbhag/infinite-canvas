@@ -81,7 +81,6 @@ function isVisible(
 
 export default function CanvasNative() {
   const { addShape, updateShape, setMode } = useCanvasStore();
-  const shapes = useCanvasStore((state) => state.shapes);
   const mode = useCanvasStore((state) => state.mode);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -100,26 +99,6 @@ export default function CanvasNative() {
   const nextPickingIdRef = useRef(1);
   // true whenever the picking canvas needs a redraw before the next hit test
   const pickingDirtyRef = useRef(true);
-
-  // Assign a stable pickingId to every new shape; clean up removed ones.
-  useEffect(() => {
-    const currentIds = new Set(shapes.map((s) => s.id));
-
-    for (const [pickId, shapeId] of pickingMapRef.current) {
-      if (!currentIds.has(shapeId)) {
-        pickingMapRef.current.delete(pickId);
-        shapeToPickingRef.current.delete(shapeId);
-      }
-    }
-
-    for (const shape of shapes) {
-      if (!shapeToPickingRef.current.has(shape.id)) {
-        const pickId = nextPickingIdRef.current++;
-        pickingMapRef.current.set(pickId, shape.id);
-        shapeToPickingRef.current.set(shape.id, pickId);
-      }
-    }
-  }, [shapes]);
 
   // ─── Per-interaction refs ─────────────────────────────────────────────────
 
@@ -277,10 +256,31 @@ export default function CanvasNative() {
     return () => window.removeEventListener('resize', resize);
   }, [render]);
 
+  // Subscribe to shapes changes without causing a React re-render.
+  // Syncs picking IDs and triggers an imperative canvas redraw directly.
   useEffect(() => {
-    pickingDirtyRef.current = true;
-    render();
-  }, [shapes, render]);
+    return useCanvasStore.subscribe((state, prev) => {
+      if (state.shapes === prev.shapes) return;
+
+      const currentIds = new Set(state.shapes.map((s) => s.id));
+      for (const [pickId, shapeId] of pickingMapRef.current) {
+        if (!currentIds.has(shapeId)) {
+          pickingMapRef.current.delete(pickId);
+          shapeToPickingRef.current.delete(shapeId);
+        }
+      }
+      for (const shape of state.shapes) {
+        if (!shapeToPickingRef.current.has(shape.id)) {
+          const pickId = nextPickingIdRef.current++;
+          pickingMapRef.current.set(pickId, shape.id);
+          shapeToPickingRef.current.set(shape.id, pickId);
+        }
+      }
+
+      pickingDirtyRef.current = true;
+      render();
+    });
+  }, [render]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
