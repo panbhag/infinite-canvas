@@ -47,8 +47,8 @@ function drawShape(
 // ─── Component ───────────────────────────────────────────────────────────────
 
 export default function CanvasNative() {
-  const { addShape, updateShape, setMode } = useCanvasStore();
-  const mode = useCanvasStore((state) => state.mode);
+  // Actions are stable references — read once from getState(), no subscription needed.
+  const { addShape, updateShape, setMode } = useCanvasStore.getState();
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
@@ -189,10 +189,16 @@ export default function CanvasNative() {
     return () => window.removeEventListener('resize', resize);
   }, [render]);
 
-  // Subscribe to shapes changes without causing a React re-render.
-  // Syncs the spatial grid and triggers an imperative canvas redraw directly.
+  // Subscribe to all store changes without causing a React re-render.
+  // Handles both mode changes (cursor) and shapes changes (grid sync + redraw).
   useEffect(() => {
     return useCanvasStore.subscribe((state, prev) => {
+      // Update cursor imperatively when mode changes — no React re-render needed.
+      if (state.mode !== prev.mode) {
+        const canvas = canvasRef.current;
+        if (canvas) canvas.style.cursor = state.mode === 'draw' ? 'crosshair' : 'grab';
+      }
+
       if (state.shapes === prev.shapes) return;
 
       const grid = spatialGridRef.current;
@@ -220,11 +226,6 @@ export default function CanvasNative() {
       render();
     });
   }, [render]);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (canvas) canvas.style.cursor = mode === 'draw' ? 'crosshair' : 'grab';
-  }, [mode]);
 
   // ─── Hit testing (spatial grid) ───────────────────────────────────────────
 
