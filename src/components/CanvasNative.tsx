@@ -51,6 +51,7 @@ export default function CanvasNative() {
   const mode = useCanvasStore((state) => state.mode);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
   const canvasOffsetRef = useRef({ x: -window.innerWidth, y: -window.innerHeight });
   const zoomRef = useRef(1);
 
@@ -60,6 +61,8 @@ export default function CanvasNative() {
   // render loop and hit test never touch off-screen shapes.
 
   const spatialGridRef = useRef(new SpatialGrid());
+  // Reused across frames — avoids allocating a new Set on every render().
+  const visibleIdsRef = useRef(new Set<string>());
 
   // ─── Per-interaction refs ─────────────────────────────────────────────────
 
@@ -101,7 +104,7 @@ export default function CanvasNative() {
   const render = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext('2d');
+    const ctx = ctxRef.current;
     if (!ctx) return;
 
     const { shapes: currentShapes } = useCanvasStore.getState();
@@ -113,7 +116,9 @@ export default function CanvasNative() {
     const viewMinY = -oy / zoom;
     const viewMaxX = viewMinX + canvas.width / zoom;
     const viewMaxY = viewMinY + canvas.height / zoom;
-    const visibleIds = spatialGridRef.current.query(viewMinX, viewMinY, viewMaxX, viewMaxY);
+    // Reuse the persistent Set — no allocation per frame.
+    spatialGridRef.current.query(viewMinX, viewMinY, viewMaxX, viewMaxY, visibleIdsRef.current);
+    const visibleIds = visibleIdsRef.current;
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.save();
@@ -170,6 +175,8 @@ export default function CanvasNative() {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+
+    ctxRef.current = canvas.getContext('2d');
 
     const resize = () => {
       canvas.width = window.innerWidth;
@@ -228,7 +235,8 @@ export default function CanvasNative() {
     const { shapes } = useCanvasStore.getState();
 
     // Grid query returns candidate ids — shapes whose cells overlap this point.
-    const candidates = spatialGridRef.current.query(wx, wy, wx, wy);
+    const candidates = new Set<string>();
+    spatialGridRef.current.query(wx, wy, wx, wy, candidates);
 
     let topShape: Shape | null = null;
     for (const id of candidates) {
