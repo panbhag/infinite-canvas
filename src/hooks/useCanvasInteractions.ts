@@ -72,8 +72,8 @@ export function useCanvasInteractions(
       e.stopPropagation();
       e.preventDefault();
 
-      const { shapesById, maxZIndex } = useCanvasStore.getState();
-      const shape = shapesById[id];
+      const { shapes, maxZIndex } = useCanvasStore.getState();
+      const shape = shapes.get(id);
       if (!shape) return;
 
       const dragEl = shapeElsRef.current.get(id);

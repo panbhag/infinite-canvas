@@ -426,7 +426,11 @@ export default function CanvasNative() {
       const canvas = canvasRef.current;
       if (canvas) canvas.style.cursor = 'grab';
     }
-  }, [addShape, updateShape, setMode, render]);
+
+    // Picking canvas is dirty after any interaction — redraw now while the CPU
+    // is idle rather than deferring the cost to the next mousedown.
+    renderPicking();
+  }, [addShape, updateShape, setMode, render, renderPicking]);
 
   useEffect(() => {
     document.addEventListener('mousemove', handleMouseMove);

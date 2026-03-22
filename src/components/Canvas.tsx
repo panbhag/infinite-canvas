@@ -39,7 +39,7 @@ export default function Canvas() {
             transform: `translate(${canvasOffsetRef.current.x}px, ${canvasOffsetRef.current.y}px)`,
           }}
         >
-          {shapes.map((shape) => (
+          {[...shapes.values()].map((shape) => (
             <ShapeItem
               key={shape.id}
               shape={shape}
