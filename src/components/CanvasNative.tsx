@@ -2,6 +2,7 @@ import { useRef, useEffect, useCallback } from 'react';
 import { useCanvasStore } from '../store/canvasStore';
 import { getRandomColor } from '../utils/colors';
 import { Shape } from '../types';
+import { SpatialGrid } from '../utils/spatialGrid';
 import Minimap from './Minimap';
 
 const MIN_ZOOM = 0.05;
@@ -43,40 +44,6 @@ function drawShape(
   ctx.stroke();
 }
 
-// ─── Color picking helpers ────────────────────────────────────────────────────
-
-/** Encode a picking ID (1-based integer) into an rgb() string. */
-function encodePickingColor(id: number): string {
-  const r = (id >> 16) & 0xff;
-  const g = (id >>  8) & 0xff;
-  const b =  id        & 0xff;
-  return `rgb(${r},${g},${b})`;
-}
-
-/** Decode the RGBA pixel bytes read from getImageData back into a picking ID. */
-function decodePickingColor(r: number, g: number, b: number): number {
-  return (r << 16) | (g << 8) | b;
-}
-
-/** Returns true if the shape's AABB intersects the visible viewport (world space). */
-function isVisible(
-  shape: Shape,
-  offsetX: number, offsetY: number,
-  zoom: number,
-  canvasW: number, canvasH: number,
-): boolean {
-  const viewMinX =  -offsetX / zoom;
-  const viewMinY =  -offsetY / zoom;
-  const viewMaxX = viewMinX + canvasW / zoom;
-  const viewMaxY = viewMinY + canvasH / zoom;
-  return (
-    shape.x + shape.width  > viewMinX &&
-    shape.x                < viewMaxX &&
-    shape.y + shape.height > viewMinY &&
-    shape.y                < viewMaxY
-  );
-}
-
 // ─── Component ───────────────────────────────────────────────────────────────
 
 export default function CanvasNative() {
@@ -87,18 +54,12 @@ export default function CanvasNative() {
   const canvasOffsetRef = useRef({ x: -window.innerWidth, y: -window.innerHeight });
   const zoomRef = useRef(1);
 
-  // ─── Offscreen picking canvas ─────────────────────────────────────────────
-  // A hidden canvas rendered with solid unique colors per shape.
-  // getImageData at the click position decodes directly to a shape ID — O(1).
+  // ─── Spatial grid ─────────────────────────────────────────────────────────
+  // Lazily-populated grid of world-space cells. Each cell holds the ids of
+  // shapes that overlap it. Viewport query returns only relevant shape ids —
+  // render loop and hit test never touch off-screen shapes.
 
-  const offscreenRef = useRef<HTMLCanvasElement | null>(null);
-  // pickingId (integer) → shapeId (string)
-  const pickingMapRef = useRef<Map<number, string>>(new Map());
-  // shapeId (string) → pickingId (integer)
-  const shapeToPickingRef = useRef<Map<string, number>>(new Map());
-  const nextPickingIdRef = useRef(1);
-  // true whenever the picking canvas needs a redraw before the next hit test
-  const pickingDirtyRef = useRef(true);
+  const spatialGridRef = useRef(new SpatialGrid());
 
   // ─── Per-interaction refs ─────────────────────────────────────────────────
 
@@ -135,40 +96,6 @@ export default function CanvasNative() {
     return { x: (screenX - ox) / zoom, y: (screenY - oy) / zoom };
   }, []);
 
-  // ─── Picking render ───────────────────────────────────────────────────────
-
-  /** Redraws the offscreen picking canvas. Called at the end of every render(). */
-  const renderPicking = useCallback(() => {
-    if (!pickingDirtyRef.current) return;  // already up to date, skip redraw
-    const offscreen = offscreenRef.current;
-    if (!offscreen) return;
-    // willReadFrequently hint is set at context creation (in the resize effect).
-    const ctx = offscreen.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return;
-
-    const { shapes: currentShapes } = useCanvasStore.getState();
-    const { x: ox, y: oy } = canvasOffsetRef.current;
-    const zoom = zoomRef.current;
-
-    ctx.clearRect(0, 0, offscreen.width, offscreen.height);
-    ctx.save();
-    ctx.translate(ox, oy);
-    ctx.scale(zoom, zoom);
-
-    // Each shape is a solid unique color — no alpha, no stroke, no anti-aliasing artifacts.
-    for (const shape of currentShapes.values()) {
-      if (!isVisible(shape, ox, oy, zoom, offscreen.width, offscreen.height)) continue;
-      const pickId = shapeToPickingRef.current.get(shape.id);
-      if (pickId === undefined) continue;
-      ctx.fillStyle = encodePickingColor(pickId);
-      roundedRect(ctx, shape.x, shape.y, shape.width, shape.height, 8);
-      ctx.fill();
-    }
-
-    ctx.restore();
-    pickingDirtyRef.current = false;
-  }, []);
-
   // ─── Main render ──────────────────────────────────────────────────────────
 
   const render = useCallback(() => {
@@ -181,15 +108,23 @@ export default function CanvasNative() {
     const { x: ox, y: oy } = canvasOffsetRef.current;
     const zoom = zoomRef.current;
 
+    // Convert the screen viewport to world space to query the grid.
+    const viewMinX = -ox / zoom;
+    const viewMinY = -oy / zoom;
+    const viewMaxX = viewMinX + canvas.width / zoom;
+    const viewMaxY = viewMinY + canvas.height / zoom;
+    const visibleIds = spatialGridRef.current.query(viewMinX, viewMinY, viewMaxX, viewMaxY);
+
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.save();
     ctx.translate(ox, oy);
     ctx.scale(zoom, zoom);
 
     // Map iteration order = insertion order = zIndex order — no sort needed.
+    // Only draw shapes returned by the grid query — off-screen shapes are never touched.
     for (const shape of currentShapes.values()) {
+      if (!visibleIds.has(shape.id)) continue;
       if (dragRef.current?.id === shape.id) continue;
-      if (!isVisible(shape, ox, oy, zoom, canvas.width, canvas.height)) continue;
       drawShape(ctx, shape, shape.x, shape.y, zoom);
     }
 
@@ -236,18 +171,9 @@ export default function CanvasNative() {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    // Create the offscreen picking canvas once, with willReadFrequently so the
-    // browser can optimise the backing store for frequent getImageData calls.
-    if (!offscreenRef.current) {
-      offscreenRef.current = document.createElement('canvas');
-      offscreenRef.current.getContext('2d', { willReadFrequently: true });
-    }
-
     const resize = () => {
       canvas.width = window.innerWidth;
       canvas.height = window.innerHeight;
-      offscreenRef.current!.width = canvas.width;
-      offscreenRef.current!.height = canvas.height;
       render();
     };
 
@@ -257,26 +183,33 @@ export default function CanvasNative() {
   }, [render]);
 
   // Subscribe to shapes changes without causing a React re-render.
-  // Syncs picking IDs and triggers an imperative canvas redraw directly.
+  // Syncs the spatial grid and triggers an imperative canvas redraw directly.
   useEffect(() => {
     return useCanvasStore.subscribe((state, prev) => {
       if (state.shapes === prev.shapes) return;
 
-      for (const [pickId, shapeId] of pickingMapRef.current) {
-        if (!state.shapes.has(shapeId)) {
-          pickingMapRef.current.delete(pickId);
-          shapeToPickingRef.current.delete(shapeId);
-        }
-      }
-      for (const shape of state.shapes.values()) {
-        if (!shapeToPickingRef.current.has(shape.id)) {
-          const pickId = nextPickingIdRef.current++;
-          pickingMapRef.current.set(pickId, shape.id);
-          shapeToPickingRef.current.set(shape.id, pickId);
-        }
+      const grid = spatialGridRef.current;
+
+      // Remove shapes that no longer exist.
+      for (const [id, shape] of prev.shapes) {
+        if (!state.shapes.has(id)) grid.remove(shape);
       }
 
-      pickingDirtyRef.current = true;
+      // Insert new shapes; re-register shapes whose position/size changed.
+      for (const [id, shape] of state.shapes) {
+        const prevShape = prev.shapes.get(id);
+        if (!prevShape) {
+          grid.insert(shape);
+        } else if (
+          prevShape.x !== shape.x || prevShape.y !== shape.y ||
+          prevShape.width !== shape.width || prevShape.height !== shape.height
+        ) {
+          grid.remove(prevShape);
+          grid.insert(shape);
+        }
+        // zIndex-only change: grid doesn't track zIndex, no update needed.
+      }
+
       render();
     });
   }, [render]);
@@ -286,27 +219,31 @@ export default function CanvasNative() {
     if (canvas) canvas.style.cursor = mode === 'draw' ? 'crosshair' : 'grab';
   }, [mode]);
 
-  // ─── Hit testing (O(1) color picking) ─────────────────────────────────────
+  // ─── Hit testing (spatial grid) ───────────────────────────────────────────
 
+  // Query the grid with the cursor's world position, then pick the topmost
+  // shape (highest zIndex) whose AABB actually contains the point.
   const getShapeAt = useCallback((clientX: number, clientY: number): Shape | null => {
-    const offscreen = offscreenRef.current;
-    if (!offscreen) return null;
-    const ctx = offscreen.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return null;
+    const { x: wx, y: wy } = toWorld(clientX, clientY);
+    const { shapes } = useCanvasStore.getState();
 
-    // Render picking canvas on demand — only runs on mousedown, not every frame.
-    renderPicking();
+    // Grid query returns candidate ids — shapes whose cells overlap this point.
+    const candidates = spatialGridRef.current.query(wx, wy, wx, wy);
 
-    // Read the single pixel at the click position — screen coords map directly.
-    const pixel = ctx.getImageData(clientX, clientY, 1, 1).data;
-    if (pixel[3] === 0) return null;  // alpha 0 = transparent background = no shape
-
-    const pickId = decodePickingColor(pixel[0], pixel[1], pixel[2]);
-    const shapeId = pickingMapRef.current.get(pickId);
-    if (!shapeId) return null;
-
-    return useCanvasStore.getState().shapes.get(shapeId) ?? null;
-  }, [renderPicking]);
+    let topShape: Shape | null = null;
+    for (const id of candidates) {
+      const shape = shapes.get(id);
+      if (!shape) continue;
+      // Exact point-in-AABB test.
+      if (wx >= shape.x && wx <= shape.x + shape.width &&
+          wy >= shape.y && wy <= shape.y + shape.height) {
+        if (!topShape || shape.zIndex > topShape.zIndex) {
+          topShape = shape;
+        }
+      }
+    }
+    return topShape;
+  }, [toWorld]);
 
   // ─── Wheel (zoom) ─────────────────────────────────────────────────────────
 
@@ -322,7 +259,6 @@ export default function CanvasNative() {
     canvasOffsetRef.current.y = e.clientY - (e.clientY - canvasOffsetRef.current.y) * ratio;
 
     zoomRef.current = newZoom;
-    pickingDirtyRef.current = true;
     scheduleRender();
   }, [scheduleRender]);
 
@@ -392,7 +328,6 @@ export default function CanvasNative() {
         canvasOffsetRef.current.y += e.clientY - panRef.current.lastY;
         panRef.current.lastX = e.clientX;
         panRef.current.lastY = e.clientY;
-        pickingDirtyRef.current = true;
         scheduleRender();
       }
     },
@@ -426,11 +361,7 @@ export default function CanvasNative() {
       const canvas = canvasRef.current;
       if (canvas) canvas.style.cursor = 'grab';
     }
-
-    // Picking canvas is dirty after any interaction — redraw now while the CPU
-    // is idle rather than deferring the cost to the next mousedown.
-    renderPicking();
-  }, [addShape, updateShape, setMode, render, renderPicking]);
+  }, [addShape, updateShape, setMode, render]);
 
   useEffect(() => {
     document.addEventListener('mousemove', handleMouseMove);
@@ -457,7 +388,6 @@ export default function CanvasNative() {
         canvasOffsetRef.current.y += e.touches[0].clientY - panRef.current.lastY;
         panRef.current.lastX = e.touches[0].clientX;
         panRef.current.lastY = e.touches[0].clientY;
-        pickingDirtyRef.current = true;
         scheduleRender();
       }
     },
